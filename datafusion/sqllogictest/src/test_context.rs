@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, DictionaryArray, Float64Array, Int32Array,
+    Array, ArrayRef, BinaryArray, DictionaryArray, Float64Array, Int32Array, Int64Array,
     LargeBinaryArray, LargeStringArray, StringArray, StructArray,
     TimestampNanosecondArray, UInt32Array, UnionArray,
 };
@@ -182,6 +182,8 @@ impl TestContext {
             "metadata.slt" | "arrow_field.slt" => {
                 info!("Registering metadata table tables");
                 register_metadata_tables(test_ctx.session_ctx()).await;
+                register_conflicting_metadata_union_tables(test_ctx.session_ctx()).await;
+                register_agree_metadata_union_cast_tables(test_ctx.session_ctx()).await;
             }
             "union_function.slt" => {
                 info!("Registering table with union column");
@@ -521,6 +523,70 @@ pub async fn register_metadata_tables(ctx: &SessionContext) {
     .unwrap();
 
     ctx.register_batch("table_with_metadata", batch).unwrap();
+}
+
+/// Registers table_metadata_union_a/b: single-column tables with conflicting field
+/// metadata and differing nullability, for the metadata.slt UNION regression test
+pub async fn register_conflicting_metadata_union_tables(ctx: &SessionContext) {
+    let a = Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("1"),
+    )]));
+    let schema_a = Arc::new(Schema::new(vec![a]));
+    let batch_a = RecordBatch::try_new(
+        Arc::clone(&schema_a),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as _],
+    )
+    .unwrap();
+
+    let b = Field::new("v", DataType::Int64, true).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("2"),
+    )]));
+    let schema_b = Arc::new(Schema::new(vec![b]));
+    let batch_b = RecordBatch::try_new(
+        Arc::clone(&schema_b),
+        vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(20)])) as _],
+    )
+    .unwrap();
+
+    ctx.register_batch("table_metadata_union_a", batch_a)
+        .unwrap();
+    ctx.register_batch("table_metadata_union_b", batch_b)
+        .unwrap();
+}
+
+/// Registers table_metadata_union_cast_a/b: single-column tables that agree on field
+/// metadata but differ in type (Int32 vs Int64), so type coercion inserts a CAST above
+/// the Int32 branch. Pins the assumption that a coercion cast preserves field metadata
+/// on both the logical and physical side, so the two union-schema intersects still agree.
+pub async fn register_agree_metadata_union_cast_tables(ctx: &SessionContext) {
+    let a = Field::new("v", DataType::Int32, false).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("5"),
+    )]));
+    let schema_a = Arc::new(Schema::new(vec![a]));
+    let batch_a = RecordBatch::try_new(
+        Arc::clone(&schema_a),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
+    )
+    .unwrap();
+
+    let b = Field::new("v", DataType::Int64, true).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("5"),
+    )]));
+    let schema_b = Arc::new(Schema::new(vec![b]));
+    let batch_b = RecordBatch::try_new(
+        Arc::clone(&schema_b),
+        vec![Arc::new(Int64Array::from(vec![Some(10), None, Some(20)])) as _],
+    )
+    .unwrap();
+
+    ctx.register_batch("table_metadata_union_cast_a", batch_a)
+        .unwrap();
+    ctx.register_batch("table_metadata_union_cast_b", batch_b)
+        .unwrap();
 }
 
 /// Create a UDF function named "example". See the `sample_udf.rs` example

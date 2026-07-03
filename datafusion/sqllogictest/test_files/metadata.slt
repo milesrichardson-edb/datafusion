@@ -520,3 +520,52 @@ NULL the id field
 
 statement ok
 drop table table_with_metadata;
+
+# Regression test: aggregating over a UNION ALL whose branches carry conflicting
+# field metadata (like PARQUET:field_id from two different files) used to fail the
+# physical planner's aggregate schema check, because the logical (type coercion) and
+# physical union schemas resolved the conflict differently instead of both dropping
+# the key. table_metadata_union_a/b are registered in Rust with conflicting field
+# metadata and differing nullability (both are needed to reproduce the mismatch).
+query I
+SELECT sum(v) FROM (
+  SELECT v FROM table_metadata_union_a
+  UNION ALL
+  SELECT v FROM table_metadata_union_b
+) u;
+----
+36
+
+statement ok
+drop table table_metadata_union_a;
+
+statement ok
+drop table table_metadata_union_b;
+
+# Regression test: aggregating over a UNION ALL whose branches agree on field
+# metadata but differ in type (Int32 vs Int64) so type coercion inserts a CAST above
+# the Int32 branch. Pins that the cast preserves field metadata on both the logical
+# and physical side, so the two union-schema intersects still agree on the key.
+query I
+SELECT sum(v) FROM (
+  SELECT v FROM table_metadata_union_cast_a
+  UNION ALL
+  SELECT v FROM table_metadata_union_cast_b
+) u;
+----
+36
+
+query T
+SELECT arrow_metadata(v, 'PARQUET:field_id') FROM (
+  SELECT v FROM table_metadata_union_cast_a
+  UNION ALL
+  SELECT v FROM table_metadata_union_cast_b
+) u LIMIT 1;
+----
+5
+
+statement ok
+drop table table_metadata_union_cast_a;
+
+statement ok
+drop table table_metadata_union_cast_b;
