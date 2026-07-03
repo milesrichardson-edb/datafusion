@@ -36,8 +36,8 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Case, Exists,
-    HigherOrderFunction, InList, InSubquery, Like, ScalarFunction, SetComparison, Sort,
-    WindowFunction,
+    HigherOrderFunction, InList, InSubquery, Like, ScalarFunction, SchemaFieldMetadata,
+    SetComparison, Sort, WindowFunction, intersect_metadata_for_union,
 };
 use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::cast_subquery;
@@ -1162,11 +1162,14 @@ fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
 /// ## Schema and Field Handling in Union Coercion
 ///
 /// **Processing order**: The function starts with the base schema (first input) and then
-/// processes remaining inputs sequentially, with later inputs taking precedence in merging.
+/// processes remaining inputs sequentially.
 ///
 /// **Schema-level metadata merging**: Later schemas take precedence for duplicate keys.
 ///
-/// **Field-level metadata merging**: Later fields take precedence for duplicate metadata keys.
+/// **Field-level metadata intersection**: A field metadata key is kept only if every
+/// input with non-empty field metadata agrees on its value; conflicting keys are
+/// dropped. This applies [`intersect_metadata_for_union`], the same helper used by
+/// `Union::try_new`.
 ///
 /// **Type coercion precedence**: The coerced type is determined by iteratively applying
 /// `type_union_coercion()` between the accumulated type and each new input's type. The
@@ -1176,8 +1179,8 @@ fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
 /// Once any input field is nullable, the result field becomes nullable permanently.
 /// Later inputs can make a field nullable but cannot make it non-nullable.
 ///
-/// **Field precedence**: Field names come from the first (base) schema, but the field properties
-/// (nullability and field-level metadata) have later schemas taking precedence.
+/// **Field precedence**: Field names come from the first (base) schema. Nullability
+/// accumulates via logical OR and field-level metadata is intersected across all inputs.
 ///
 /// **Example**:
 /// ```sql
@@ -1188,13 +1191,14 @@ fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
 /// SELECT a, b FROM table3  -- a: Int32, metadata {"encoding": "utf8"}, nullable=false
 /// -- Result:
 /// -- a: Int64 (from type coercion), nullable=true (from table2),
-/// -- metadata: {"source": "t2", "encoding": "utf8"} (later inputs take precedence)
+/// -- metadata: {} (no key has the same value in all inputs)
 /// ```
 ///
 /// **Precedence Summary**:
 /// - **Datatypes**: Determined by `type_union_coercion()` rules, not input order
 /// - **Nullability**: Later inputs can add nullability but cannot remove it (logical OR)
-/// - **Metadata**: Later inputs take precedence for same keys (HashMap::extend semantics)
+/// - **Field-level metadata**: Intersected across inputs; conflicting keys are dropped
+/// - **Schema-level metadata**: Later inputs take precedence for same keys (`HashMap::extend` semantics)
 pub fn coerce_union_schema(inputs: &[Arc<LogicalPlan>]) -> Result<DFSchema> {
     coerce_union_schema_with_schema(&inputs[1..], inputs[0].schema())
 }
@@ -1212,11 +1216,13 @@ fn coerce_union_schema_with_schema(
         .iter()
         .map(|f| f.is_nullable())
         .collect::<Vec<_>>();
-    let mut union_field_meta = base_schema
+    // Each field's metadata from every input, collected so it can be
+    // intersected once after the loop rather than merged as we go
+    let mut union_field_meta: Vec<Vec<&SchemaFieldMetadata>> = base_schema
         .fields()
         .iter()
-        .map(|f| f.metadata().clone())
-        .collect::<Vec<_>>();
+        .map(|f| vec![f.metadata()])
+        .collect();
 
     let mut metadata = base_schema.metadata().clone();
 
@@ -1256,9 +1262,15 @@ fn coerce_union_schema_with_schema(
 
             *union_datatype = coerced_type;
             *union_nullable = *union_nullable || plan_field.is_nullable();
-            union_field_map.extend(plan_field.metadata().clone());
+            union_field_map.push(plan_field.metadata());
         }
     }
+
+    let union_field_meta: Vec<SchemaFieldMetadata> = union_field_meta
+        .into_iter()
+        .map(intersect_metadata_for_union)
+        .collect();
+
     let union_qualified_fields = izip!(
         base_schema.fields(),
         union_datatypes.into_iter(),
@@ -1318,6 +1330,7 @@ mod test {
     use crate::analyzer::Analyzer;
     use crate::analyzer::type_coercion::{
         TypeCoercion, TypeCoercionRewriter, coerce_case_expression,
+        coerce_union_schema_with_schema,
     };
     use crate::assert_analyzed_plan_with_config_eq_snapshot;
     use datafusion_common::config::ConfigOptions;
@@ -1485,6 +1498,81 @@ mod test {
             EmptyRelation: rows=0
         "
         )
+    }
+
+    fn empty_with_field_metadata(
+        metadata: std::collections::HashMap<String, String>,
+    ) -> Arc<LogicalPlan> {
+        Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(
+                DFSchema::try_from_qualified_schema(
+                    TableReference::full("datafusion", "test", "foo"),
+                    &Schema::new(vec![
+                        Field::new("a", DataType::Int32, false).with_metadata(metadata),
+                    ]),
+                )
+                .unwrap(),
+            ),
+        }))
+    }
+
+    #[test]
+    fn coerce_union_schema_field_metadata_same_on_all_inputs() -> Result<()> {
+        let metadata =
+            std::collections::HashMap::from([("key".to_string(), "val".to_string())]);
+        let base = empty_with_field_metadata(metadata.clone());
+        let other = empty_with_field_metadata(metadata.clone());
+
+        let schema = coerce_union_schema_with_schema(&[other], base.schema())?;
+
+        assert_eq!(schema.field(0).metadata(), &metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn coerce_union_schema_field_metadata_conflicting_dropped() -> Result<()> {
+        // Conflicting values are dropped rather than merged, matching
+        // intersect_metadata_for_union in Union::try_new
+        let base = empty_with_field_metadata(std::collections::HashMap::from([(
+            "key".to_string(),
+            "a".to_string(),
+        )]));
+        let other = empty_with_field_metadata(std::collections::HashMap::from([(
+            "key".to_string(),
+            "b".to_string(),
+        )]));
+
+        let schema = coerce_union_schema_with_schema(&[other], base.schema())?;
+
+        assert!(schema.field(0).metadata().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn coerce_union_schema_field_metadata_empty_input_skipped() -> Result<()> {
+        // An input without field metadata does not erase metadata from the
+        // inputs that have it
+        let metadata =
+            std::collections::HashMap::from([("key".to_string(), "val".to_string())]);
+        let base = empty_with_field_metadata(metadata.clone());
+        let other = empty_with_field_metadata(std::collections::HashMap::new());
+
+        let schema = coerce_union_schema_with_schema(&[other], base.schema())?;
+
+        assert_eq!(schema.field(0).metadata(), &metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn coerce_union_schema_field_metadata_empty_on_all_inputs() -> Result<()> {
+        let base = empty_with_field_metadata(std::collections::HashMap::new());
+        let other = empty_with_field_metadata(std::collections::HashMap::new());
+
+        let schema = coerce_union_schema_with_schema(&[other], base.schema())?;
+
+        assert!(schema.field(0).metadata().is_empty());
+        Ok(())
     }
 
     #[test]
