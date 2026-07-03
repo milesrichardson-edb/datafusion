@@ -520,3 +520,44 @@ NULL the id field
 
 statement ok
 drop table table_with_metadata;
+
+##########
+## Regression tests: UNION ALL field metadata is computed with the SAME
+## intersect semantics (`intersect_metadata_for_union`) everywhere it is
+## derived -- logical (`coerce_union_schema_with_schema`, via the
+## TypeCoercion analyzer) and physical (`union_schema`, shared by
+## UnionExec/InterleaveExec) -- rather than one of them merging with
+## last-writer-wins semantics. `table_metadata_union_a`/`_b` are registered
+## in Rust (test_context.rs) with CONFLICTING non-empty `PARQUET:field_id`
+## field metadata and ASYMMETRIC nullability (a: NOT NULL, b: NULLABLE);
+## the asymmetry is required to reproduce the bug -- see
+## register_conflicting_metadata_union_tables's doc comment.
+##########
+
+# Regression test: UNION ALL + aggregate over branches with conflicting,
+# non-empty field metadata must not trip the physical planner's exact
+# schema-equality check for Aggregate inputs.
+query I
+SELECT sum(v) FROM (
+  SELECT v FROM table_metadata_union_a
+  UNION ALL
+  SELECT v FROM table_metadata_union_b
+) u;
+----
+36
+
+# Note: the one-branch-empty/other-has-a-value skip-empty regression guard
+# (#21127's already-fixed behavior) is covered by Rust unit/integration
+# tests instead of here -- the sqllogictest harness has no SQL expression
+# that reliably produces a value with genuinely empty field metadata (a
+# literal NULL is the closest, but its own field-metadata shape is a
+# separate, already-tested code path). See:
+#   - datafusion/physical-plan/src/union.rs::union_schema_field_metadata_empty_metadata_branch_skipped
+#   - datafusion/optimizer/src/analyzer/type_coercion.rs::coerce_union_schema_field_metadata_empty_metadata_branch_skipped
+#   - datafusion/core/tests/sql/union_field_metadata.rs::union_all_field_metadata_empty_branch_skipped
+
+statement ok
+drop table table_metadata_union_a;
+
+statement ok
+drop table table_metadata_union_b;

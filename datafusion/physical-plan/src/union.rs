@@ -54,6 +54,7 @@ use datafusion_common::{
     Result, assert_or_internal_err, exec_err, internal_datafusion_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_expr::expr::intersect_metadata_for_union;
 use datafusion_physical_expr::{
     EquivalenceProperties, PhysicalExpr, calculate_union, conjunction,
 };
@@ -680,12 +681,15 @@ fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> Result<SchemaRef> {
         return exec_err!("Cannot create union schema from empty inputs");
     }
 
-    let first_schema = inputs[0].schema();
+    // Collect once: `ExecutionPlan::schema()` returns an owned Arc, so borrowing
+    // `field(i).metadata()` through a temporary would not live long enough below.
+    let schemas: Vec<SchemaRef> = inputs.iter().map(|input| input.schema()).collect();
+    let first_schema = Arc::clone(&schemas[0]);
     let first_field_count = first_schema.fields().len();
 
     // validate that all inputs have the same number of fields
-    for (idx, input) in inputs.iter().enumerate().skip(1) {
-        let field_count = input.schema().fields().len();
+    for (idx, schema) in schemas.iter().enumerate().skip(1) {
+        let field_count = schema.fields().len();
         if field_count != first_field_count {
             return exec_err!(
                 "UnionExec/InterleaveExec requires all inputs to have the same number of fields. \
@@ -700,37 +704,35 @@ fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> Result<SchemaRef> {
             // which also uses the left side names.
             let base_field = first_schema.field(i).clone();
 
-            // Coerce metadata and nullability across all inputs
+            // Intersect per-field metadata across all inputs with the SAME semantics
+            // the logical planner uses for unions (`intersect_metadata_for_union`):
+            // empty maps are skipped, a key survives only if every non-empty input
+            // agrees on its value. Anything else (previously: a last-writer-wins
+            // merge) makes the physical union schema diverge from the logical one
+            // and trips the physical planner's aggregate input-schema check when
+            // union branches carry conflicting field metadata (e.g. differing
+            // `PARQUET:field_id` from scans of distinct Parquet/Iceberg tables).
+            let metadata = intersect_metadata_for_union(
+                schemas.iter().map(|s| s.field(i).metadata()),
+            );
 
-            inputs
+            // Coerce nullability across all inputs (unchanged): pick the first
+            // nullable candidate if any input is nullable, else the first input.
+            schemas
                 .iter()
-                .enumerate()
-                .map(|(input_idx, input)| {
-                    let field = input.schema().field(i).clone();
-                    let mut metadata = field.metadata().clone();
-
-                    let other_metadatas = inputs
-                        .iter()
-                        .enumerate()
-                        .filter(|(other_idx, _)| *other_idx != input_idx)
-                        .flat_map(|(_, other_input)| {
-                            other_input.schema().field(i).metadata().clone().into_iter()
-                        });
-
-                    metadata.extend(other_metadatas);
-                    field.with_metadata(metadata)
-                })
+                .map(|schema| schema.field(i).clone())
                 .find_or_first(Field::is_nullable)
                 // We can unwrap this because if inputs was empty, this would've already panic'ed when we
                 // indexed into inputs[0].
                 .unwrap()
+                .with_metadata(metadata)
                 .with_name(base_field.name())
         })
         .collect::<Vec<_>>();
 
-    let all_metadata_merged = inputs
+    let all_metadata_merged = schemas
         .iter()
-        .flat_map(|i| i.schema().metadata().clone().into_iter())
+        .flat_map(|schema| schema.metadata().clone().into_iter())
         .collect();
 
     Ok(Arc::new(Schema::new_with_metadata(
@@ -821,6 +823,7 @@ mod tests {
     use datafusion_common::{ColumnStatistics, ScalarValue};
     use datafusion_physical_expr::equivalence::convert_to_orderings;
     use datafusion_physical_expr::expressions::col;
+    use std::collections::HashMap;
 
     // Generate a schema which consists of 7 columns (a, b, c, d, e, f, g)
     fn create_test_schema() -> Result<SchemaRef> {
@@ -1196,6 +1199,92 @@ mod tests {
                 .to_string()
                 .contains("Cannot create union schema from empty inputs")
         );
+    }
+
+    // Regression tests for `union_schema`'s per-field metadata semantics.
+    //
+    // `union_schema` (shared by `UnionExec` and `InterleaveExec`) must combine
+    // per-branch field metadata with the SAME `intersect_metadata_for_union`
+    // semantics as `Union::try_new` (datafusion/expr/src/logical_plan/plan.rs)
+    // and `coerce_union_schema_with_schema`
+    // (datafusion/optimizer/src/analyzer/type_coercion.rs) -- previously it
+    // merged metadata with last-writer-wins `HashMap::extend`, which could
+    // silently disagree with the logical schema (built via the other two
+    // sites) on conflicting keys and trip the physical planner's exact-schema
+    // equality check for `LogicalPlan::Aggregate` inputs. Test names mirror
+    // `mod intersect_metadata_tests` in `datafusion/expr/src/expr.rs`.
+    fn schema_with_single_metadata_field(metadata: HashMap<String, String>) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true).with_metadata(metadata),
+        ]))
+    }
+
+    fn memory_exec_with_schema(schema: SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(TestMemoryExec::try_new(&[], schema, None)?))
+    }
+
+    #[test]
+    fn union_schema_field_metadata_all_branches_same_metadata() -> Result<()> {
+        let metadata = HashMap::from([("key".to_string(), "val".to_string())]);
+        let schema1 = schema_with_single_metadata_field(metadata.clone());
+        let schema2 = schema_with_single_metadata_field(metadata.clone());
+
+        let schema = union_schema(&[
+            memory_exec_with_schema(schema1)?,
+            memory_exec_with_schema(schema2)?,
+        ])?;
+
+        assert_eq!(schema.field(0).metadata(), &metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn union_schema_field_metadata_conflicting_metadata_dropped() -> Result<()> {
+        let schema1 = schema_with_single_metadata_field(HashMap::from([(
+            "key".to_string(),
+            "a".to_string(),
+        )]));
+        let schema2 = schema_with_single_metadata_field(HashMap::from([(
+            "key".to_string(),
+            "b".to_string(),
+        )]));
+
+        let schema = union_schema(&[
+            memory_exec_with_schema(schema1)?,
+            memory_exec_with_schema(schema2)?,
+        ])?;
+
+        assert!(schema.field(0).metadata().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn union_schema_field_metadata_empty_metadata_branch_skipped() -> Result<()> {
+        let metadata = HashMap::from([("key".to_string(), "val".to_string())]);
+        let schema1 = schema_with_single_metadata_field(metadata.clone());
+        let schema2 = schema_with_single_metadata_field(HashMap::new());
+
+        let schema = union_schema(&[
+            memory_exec_with_schema(schema1)?,
+            memory_exec_with_schema(schema2)?,
+        ])?;
+
+        assert_eq!(schema.field(0).metadata(), &metadata);
+        Ok(())
+    }
+
+    #[test]
+    fn union_schema_field_metadata_all_branches_empty_metadata() -> Result<()> {
+        let schema1 = schema_with_single_metadata_field(HashMap::new());
+        let schema2 = schema_with_single_metadata_field(HashMap::new());
+
+        let schema = union_schema(&[
+            memory_exec_with_schema(schema1)?,
+            memory_exec_with_schema(schema2)?,
+        ])?;
+
+        assert!(schema.field(0).metadata().is_empty());
+        Ok(())
     }
 
     #[test]

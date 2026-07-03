@@ -182,6 +182,7 @@ impl TestContext {
             "metadata.slt" | "arrow_field.slt" => {
                 info!("Registering metadata table tables");
                 register_metadata_tables(test_ctx.session_ctx()).await;
+                register_conflicting_metadata_union_tables(test_ctx.session_ctx()).await;
             }
             "union_function.slt" => {
                 info!("Registering table with union column");
@@ -521,6 +522,50 @@ pub async fn register_metadata_tables(ctx: &SessionContext) {
     .unwrap();
 
     ctx.register_batch("table_with_metadata", batch).unwrap();
+}
+
+/// Registers two single-column tables with CONFLICTING non-empty field-level
+/// metadata (differing `PARQUET:field_id`-shaped values) and ASYMMETRIC
+/// nullability (one NOT NULL, one NULLABLE) -- the shape that reproduces the
+/// `UNION ALL` field-metadata mismatch between the logical schema built by
+/// `coerce_union_schema_with_schema` (datafusion/optimizer/src/analyzer/
+/// type_coercion.rs) and the physical schema built by `union_schema`
+/// (datafusion/physical-plan/src/union.rs): the two merge sites pick their
+/// "last writer" differently (nullability-driven vs. sequential order), so
+/// with symmetric nullability they can accidentally agree and mask the bug.
+/// See `table_metadata_union_a`/`table_metadata_union_b` usage in
+/// `metadata.slt`.
+pub async fn register_conflicting_metadata_union_tables(ctx: &SessionContext) {
+    let a = Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("1"),
+    )]));
+    let schema_a = Arc::new(Schema::new(vec![a]));
+    let batch_a = RecordBatch::try_new(
+        Arc::clone(&schema_a),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])) as _],
+    )
+    .unwrap();
+
+    let b = Field::new("v", DataType::Int64, true).with_metadata(HashMap::from([(
+        String::from("PARQUET:field_id"),
+        String::from("2"),
+    )]));
+    let schema_b = Arc::new(Schema::new(vec![b]));
+    let batch_b = RecordBatch::try_new(
+        Arc::clone(&schema_b),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![
+            Some(10),
+            None,
+            Some(20),
+        ])) as _],
+    )
+    .unwrap();
+
+    ctx.register_batch("table_metadata_union_a", batch_a)
+        .unwrap();
+    ctx.register_batch("table_metadata_union_b", batch_b)
+        .unwrap();
 }
 
 /// Create a UDF function named "example". See the `sample_udf.rs` example
